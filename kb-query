@@ -1,0 +1,707 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+kb-query — 紫鸾知识平台命令行查询工具（单文件 / 零依赖 / 仅标准库）
+
+用法概览：
+    kb-query "复位值怎么定义"                # 检索模式（默认）：返回 top-N 文档块
+    kb-query "ibex 流水线如何连接" --chat     # 问答模式：平台生成答案 + 引用来源
+    kb-query --list                          # 列出当前租户可用知识库
+    kb-query "..." --kb KLB_aaa --kb KLB_bbb # 指定知识库（可多个）
+    kb-query "..." --top-n 3 --json          # JSON 输出，供 agent 程序化消费
+
+配置优先级：命令行参数 > 环境变量 > ~/.kb-query.json
+退出码：0 成功（含"无结果"）| 1 缺配置/用法错误 | 2 网络或平台错误 | 3 鉴权失败
+"""
+import argparse
+import json
+import os
+import re
+import socket
+import ssl
+import stat
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+__version__ = "1.2.1"
+
+CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".kb-query.json")
+
+CONFIG_SPEC = {
+    "api_key":       ("KB_QUERY_API_KEY",       "api_key",       None,             True),
+    "recall_base":   ("KB_QUERY_RECALL_BASE",   "recall_base",   None,             True),
+    "chat_base":     ("KB_QUERY_CHAT_BASE",     "chat_base",     None,             True),
+    "tenant_id":     ("KB_QUERY_TENANT_ID",     "tenant_id",     None,             True),
+    "dept_id":       ("KB_QUERY_DEPT_ID",       "dept_id",       "",               False),
+    "default_kb":    ("KB_QUERY_DEFAULT_KB",    "default_kb",    "",               False),
+    "timeout":       ("KB_QUERY_TIMEOUT",       "timeout",       "30",             False),
+    "chat_timeout":  ("KB_QUERY_CHAT_TIMEOUT",  "chat_timeout",  "120",            False),
+    "open_llm":      ("KB_QUERY_OPEN_LLM",      "open_llm",      "0",              False),
+    "verify_ssl":    ("KB_QUERY_VERIFY_SSL",    "verify_ssl",    "1",              False),
+    "admin_contact": ("KB_QUERY_ADMIN_CONTACT", "admin_contact", "知识平台管理员",  False),
+}
+
+EXIT_OK = 0
+EXIT_CONFIG = 1
+EXIT_NETWORK = 2
+EXIT_AUTH = 3
+
+_RAG_PREFIX = "/rag-platform-default"
+
+# chat 模式"未命中"兜底话术特征词
+_NO_HIT_PATTERNS = ("未检索到", "未能检索到", "未找到相关", "无法为您的问题生成", "未能检索到相关知识")
+# 仅当特征词出现在答案开头 _NO_HIT_HEAD 个字符内才判未命中，避免正常长回答正文引用到这些词时误判
+_NO_HIT_HEAD = 40
+
+
+# ---------------------------------------------------------------- 输出工具
+
+def _setup_io():
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
+def out(s=""):
+    sys.stdout.write(str(s) + "\n")
+
+
+def err(s):
+    sys.stderr.write(str(s) + "\n")
+
+
+def warn(s):
+    err("kb-query: 警告: " + s)
+
+
+def die(msg, code):
+    err("kb-query: " + msg)
+    sys.exit(code)
+
+
+# ---------------------------------------------------------------- URL 工具
+
+def normalize_base(base):
+    """归一化网关地址：去掉尾部 / 和 /rag-platform-default，由工具统一追加前缀。
+    这样 http://host:port 和 http://host:port/rag-platform-default 都能正确工作。"""
+    base = (base or "").rstrip("/")
+    if base.endswith(_RAG_PREFIX):
+        base = base[:-len(_RAG_PREFIX)]
+    return base.rstrip("/")
+
+
+def build_url(base, path):
+    return normalize_base(base) + _RAG_PREFIX + path
+
+
+# ---------------------------------------------------------------- 配置体系
+
+def load_file_config():
+    if not os.path.exists(CONFIG_PATH):
+        return {}
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            err("kb-query: 警告: 配置文件 %s 不是 JSON 对象，已忽略" % CONFIG_PATH)
+            return {}
+        return data
+    except Exception as e:
+        err("kb-query: 警告: 配置文件 %s 解析失败（%s），已忽略" % (CONFIG_PATH, e))
+        return {}
+
+
+def resolve_config(cli_args):
+    """
+    按 CLI > 环境变量 > 配置文件 > 默认值 合并。
+    环境变量只要被设置（即使为空串）就覆盖文件值——空串是合法的显式覆盖。
+    """
+    file_cfg = load_file_config()
+    cfg = {}
+    for key, (env_name, file_key, default, _required) in CONFIG_SPEC.items():
+        if env_name in os.environ:
+            val = os.environ[env_name]          # 已设置（含空串）→ 用它
+        else:
+            val = file_cfg.get(file_key)         # 未设置 → 取文件值
+        if val is None:
+            val = default
+        cfg[key] = val
+
+    # CLI 覆盖（仅限 argparse 里的非敏感项）
+    if cli_args.timeout is not None:
+        cfg["timeout"] = str(cli_args.timeout)
+        cfg["chat_timeout"] = str(cli_args.timeout)
+    if cli_args.insecure:
+        cfg["verify_ssl"] = "0"
+    if cli_args.kb:
+        kb_filtered = [k.strip() for k in cli_args.kb if k and k.strip()]
+        if kb_filtered:
+            cfg["default_kb"] = ",".join(kb_filtered)
+
+    missing = []
+    for key, (env_name, _file_key, _d, required) in CONFIG_SPEC.items():
+        if required and not cfg.get(key):
+            missing.append((key, env_name))
+    return cfg, missing
+
+
+def report_missing(missing):
+    lines = ["缺少必要配置，无法启动："]
+    for key, env_name in missing:
+        lines.append("  - %-14s 请设置环境变量 %s，或在 %s 中配置" % (key, env_name, CONFIG_PATH))
+    lines.append("详见 kb-query使用说明.md 的「配置」一节。")
+    die("\n".join(lines), EXIT_CONFIG)
+
+
+def parse_kb_list(value):
+    if not value:
+        return []
+    if isinstance(value, list):
+        return [str(x).strip() for x in value if str(x).strip()]
+    return [x.strip() for x in str(value).split(",") if x.strip()]
+
+
+def to_int(value, name, minimum=1):
+    try:
+        n = int(str(value))
+    except (TypeError, ValueError):
+        die("配置项 %s=%r 不是整数" % (name, value), EXIT_CONFIG)
+    if n < minimum:
+        die("配置项 %s=%r 必须 >= %d" % (name, value, minimum), EXIT_CONFIG)
+    return n
+
+
+def is_truthy(val):
+    return str(val).strip().lower() in ("1", "true", "yes", "on")
+
+
+# ---------------------------------------------------------------- HTTP 层
+
+def make_ssl_context(verify):
+    if verify:
+        return None
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
+def post_json(url, body, api_key, timeout, verify_ssl, query_string=None):
+    if query_string:
+        url = url + "?" + query_string
+    data = b"" if body is None else json.dumps(body, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method="POST")
+    req.add_header("Content-Type", "application/json; charset=utf-8")
+    req.add_header("Authorization", "Bearer " + api_key)
+    ctx = make_ssl_context(is_truthy(verify_ssl))
+    try:
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            die("API KEY 无效或过期（HTTP %d），请联系%s重新签发" % (e.code, api_contact()), EXIT_AUTH)
+        detail = ""
+        try:
+            detail = e.read().decode("utf-8", errors="replace")[:200]
+        except Exception:
+            pass
+        die("知识平台返回 HTTP %d：%s" % (e.code, detail or e.reason), EXIT_NETWORK)
+    except (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError, OSError) as e:
+        reason = getattr(e, "reason", e)
+        die("无法连接知识平台（%s），请确认在黄区网络内、网关地址配置正确" % reason, EXIT_NETWORK)
+
+    try:
+        return json.loads(raw)
+    except ValueError:
+        die("知识平台返回了非 JSON 内容：%s" % raw[:200], EXIT_NETWORK)
+
+
+# admin_contact 延迟求值（避免全局状态）
+_api_contact_cache = None
+def set_api_contact(val):
+    global _api_contact_cache
+    _api_contact_cache = val
+def api_contact():
+    return _api_contact_cache or "知识平台管理员"
+
+
+def check_platform_code(resp):
+    code = resp.get("code")
+    if code is None or code == 200:
+        return
+    msg = resp.get("msg") or ""
+    if code in (401, 403):
+        die("API KEY 无效或过期（%s），请联系%s重新签发" % (msg or code, api_contact()), EXIT_AUTH)
+    die("知识平台返回错误 code=%s msg=%s" % (code, msg), EXIT_NETWORK)
+
+
+# ---------------------------------------------------------------- 流式 (SSE)
+
+def _open_stream(url, body, api_key, timeout, verify_ssl):
+    """POST JSON 发起流式请求，返回 response 对象供逐行读取。"""
+    data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method="POST")
+    req.add_header("Content-Type", "application/json; charset=utf-8")
+    req.add_header("Authorization", "Bearer " + api_key)
+    ctx = make_ssl_context(is_truthy(verify_ssl))
+    try:
+        return urllib.request.urlopen(req, timeout=timeout, context=ctx)
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            die("API KEY 无效或过期（HTTP %d），请联系%s重新签发" % (e.code, api_contact()), EXIT_AUTH)
+        detail = ""
+        try:
+            detail = e.read().decode("utf-8", errors="replace")[:200]
+        except Exception:
+            pass
+        die("知识平台返回 HTTP %d：%s" % (e.code, detail or e.reason), EXIT_NETWORK)
+    except (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError, OSError) as e:
+        reason = getattr(e, "reason", e)
+        die("无法连接知识平台（%s），请确认在黄区网络内、网关地址配置正确" % reason, EXIT_NETWORK)
+
+
+def _iter_sse(resp):
+    """逐行解析 SSE 流，yield 解析后的 JSON dict。流中断时 die(EXIT_NETWORK)。"""
+    try:
+        for raw_line in resp:
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            if not line.startswith("data:"):
+                continue
+            data_str = line[5:].strip()
+            if not data_str:
+                continue
+            try:
+                yield json.loads(data_str)
+            except ValueError:
+                continue
+    except (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError, OSError) as e:
+        reason = getattr(e, "reason", e)
+        die("流式传输中断（%s），请确认网络稳定" % reason, EXIT_NETWORK)
+
+
+# ---------------------------------------------------------------- 三个 API
+
+def api_recall(cfg, question, kb_ids, top_n):
+    url = build_url(cfg["recall_base"], "/zsgl/knowledgeRecall")
+    body = {
+        "tenant_id": cfg["tenant_id"],
+        "query": [question],
+        "knowledge_ids": kb_ids,
+        "top_n": top_n,
+        "rerank_enable": 1,
+        "search_method": 3,
+        "dept_ids": [cfg["dept_id"]],
+    }
+    timeout = to_int(cfg["timeout"], "timeout")
+    resp = post_json(url, body, cfg["api_key"], timeout, cfg["verify_ssl"])
+    check_platform_code(resp)
+    data = resp.get("data")
+    if not isinstance(data, dict):
+        return {}
+    return data
+
+
+def api_chat_stream(cfg, question, kb_ids):
+    """发起流式 chat 请求，返回 SSE response 对象。"""
+    url = build_url(cfg["chat_base"], "/chat/openai")
+    body = {
+        "query": question,
+        "stream": True,
+        "session_id": None,
+        "params": {
+            "tenant_id": cfg["tenant_id"],
+            "knowledges": kb_ids,
+            "tags": [],
+            "dept_ids": [cfg["dept_id"]],
+            "mode": "eda",
+            "open_llm": str(cfg.get("open_llm") or "0"),
+        },
+    }
+    timeout = to_int(cfg["chat_timeout"], "chat_timeout")
+    return _open_stream(url, body, cfg["api_key"], timeout, cfg["verify_ssl"])
+
+
+def api_list_kb(cfg):
+    url = build_url(cfg["recall_base"], "/zsgl/knowledgeBaseListByTenantId")
+    qs = urllib.parse.urlencode({"TENANT-ID": cfg["tenant_id"]})
+    timeout = to_int(cfg["timeout"], "timeout")
+    resp = post_json(url, None, cfg["api_key"], timeout, cfg["verify_ssl"], query_string=qs)
+    check_platform_code(resp)
+    data = resp.get("data")
+    if not isinstance(data, list):
+        return []
+    return data
+
+
+# ---------------------------------------------------------------- 格式化
+
+_THINK_RE = re.compile(r"<think>.*?</think>\s*", re.S)
+
+
+def strip_think(text):
+    return _THINK_RE.sub("", text or "").strip()
+
+
+def truncate(text, max_chars):
+    if max_chars <= 0:
+        return text
+    text = (text or "").strip()
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars].rstrip() + " …[截断]"
+
+
+def fmt_score(score):
+    try:
+        return "%.2f" % float(score)
+    except (TypeError, ValueError):
+        return str(score)
+
+
+def fmt_section(section):
+    """将平台的 # 分隔路径转为 PRD 要求的 › 分隔。"""
+    if not section:
+        return ""
+    parts = [p.strip() for p in str(section).split("#") if p.strip()]
+    return " › ".join(parts)
+
+
+def is_no_hit_answer(answer):
+    """检测 chat 模式下平台返回的"未命中"兜底话术。
+    只检查答案开头 _NO_HIT_HEAD 个字符：正常回答正文即使引用到特征词也不会误判。"""
+    if not answer or not answer.strip():
+        return True
+    head = answer.strip()[:_NO_HIT_HEAD]
+    return any(p in head for p in _NO_HIT_PATTERNS)
+
+
+def print_recall_human(data, max_chars):
+    faq = (data.get("answer") or "").strip()
+    records = [r for r in (data.get("records") or []) if isinstance(r, dict)]
+
+    if faq:
+        out("[命中 FAQ]")
+        out(faq)
+        return
+
+    if not records:
+        out("未检索到相关内容。可换用 --chat 模式提问，或联系管理员完善知识库。")
+        return
+
+    for i, r in enumerate(records, 1):
+        title = r.get("doc_title") or r.get("fileName") or "(未知文档)"
+        section = fmt_section(r.get("chunk_title") or r.get("catalog") or "")
+        head = "[%d] %s · 得分 %s" % (i, title, fmt_score(r.get("score")))
+        if section:
+            head += " · 章节: " + section
+        out(head)
+        out("    " + truncate(r.get("chunk_text") or "", max_chars))
+        out("")
+
+
+def recall_to_json_obj(data, max_chars):
+    faq = (data.get("answer") or "").strip()
+    records = [r for r in (data.get("records") or []) if isinstance(r, dict)]
+    results = []
+    for i, r in enumerate(records, 1):
+        results.append({
+            "rank": i,
+            "score": r.get("score"),
+            "doc_title": r.get("doc_title") or r.get("fileName"),
+            "doc_id": r.get("doc_id"),
+            "knowledge_id": r.get("knowledge_id") or r.get("knowledgeId"),
+            "knowledge_name": r.get("knowledge_name"),
+            "catalog": r.get("catalog"),
+            "chunk_title": r.get("chunk_title"),
+            "chunk_id": r.get("chunk_id"),
+            "chunk_position": r.get("chunk_position"),
+            "chunk_text": truncate(r.get("chunk_text") or "", max_chars),
+        })
+    return {"faq_answer": faq or None, "count": len(results), "results": results}
+
+
+def _print_sources(sources, max_chars, hit):
+    """打印引用来源 / 参考文档。"""
+    if not sources:
+        out("（本次回答未引用知识库文档）")
+        return
+    if hit:
+        out("引用来源：")
+    else:
+        out("参考文档（相关度低）：")
+    for i, s in enumerate(sources, 1):
+        name = s.get("name") or "(未知文档)"
+        line = "[%d] %s · 得分 %s" % (i, name, fmt_score(s.get("score")))
+        if s.get("knowledge_name"):
+            line += " · 知识库: " + str(s["knowledge_name"])
+        if s.get("catalog"):
+            line += " · 目录: " + fmt_section(s["catalog"])
+        out(line)
+        chunks = s.get("chunks") or []
+        if chunks:
+            out("    " + truncate(chunks[0], max_chars))
+
+
+# ---------------------------------------------------------------- 子命令逻辑
+
+def cmd_list(cfg, as_json):
+    kbs = api_list_kb(cfg)
+    if as_json:
+        out(json.dumps({
+            "mode": "list",
+            "count": len(kbs),
+            "knowledge_bases": [
+                {"id": k.get("knowledgeId"), "name": k.get("knowledgeName")} for k in kbs
+            ],
+        }, ensure_ascii=False, indent=2))
+        return
+    if not kbs:
+        out("当前租户下没有可用知识库（tenant_id=%s）。" % cfg["tenant_id"])
+        return
+    out("可用知识库（tenant_id=%s，共 %d 个）：" % (cfg["tenant_id"], len(kbs)))
+    for k in kbs:
+        out("  %s  %s" % (k.get("knowledgeId"), k.get("knowledgeName")))
+
+
+def cmd_recall(cfg, question, kb_ids, top_n, max_chars, as_json):
+    data = api_recall(cfg, question, kb_ids, top_n)
+    if as_json:
+        obj = recall_to_json_obj(data, max_chars)
+        obj["mode"] = "recall"
+        obj["query"] = question
+        out(json.dumps(obj, ensure_ascii=False, indent=2))
+    else:
+        print_recall_human(data, max_chars)
+
+
+_THINK_OPEN = "<think>"
+_THINK_CLOSE = "</think>"
+
+
+def _stream_content(resp, as_json):
+    """解析 SSE 流，返回 (sources, content_parts, session_id)。
+    非 JSON 模式下实时输出答案正文（自动跳过 <think> 块）。
+
+    缓冲策略：非 think 内容及时输出，仅保留可能是 "<think>" 前缀的尾部；
+    流结束时若残留不是 think 前缀则一并输出（保证不丢尾巴），
+    半截 think 标签（如 "<th"）不会被误输出到终端。"""
+    sources = []
+    content_parts = []
+    session_id = None
+    dropping = False       # True = 正在丢弃 think 块内内容
+    buf = ""               # 未决缓冲：仅可能是 "<think>" 前缀的尾巴
+
+    def flush(s):
+        if s:
+            sys.stdout.write(s)
+            sys.stdout.flush()
+
+    def prefix_len(s):
+        """返回 s 尾部与 "<think>" 前缀匹配的最大长度（0~6）。"""
+        for L in range(min(len(s), len(_THINK_OPEN) - 1), 0, -1):
+            if _THINK_OPEN[:L] == s[-L:]:
+                return L
+        return 0
+
+    for chunk in _iter_sse(resp):
+        if chunk.get("code") is not None and chunk.get("code") != 200:
+            check_platform_code(chunk)
+            continue
+        if not session_id:
+            session_id = chunk.get("id")
+        choices = chunk.get("choices") or []
+        if not choices:
+            continue
+        delta = choices[0].get("delta") or {}
+        if "source" in delta and delta["source"]:
+            sources = [s for s in delta["source"] if isinstance(s, dict)]
+        content = delta.get("content") or ""
+        if not content:
+            continue
+        content_parts.append(content)
+        if as_json:
+            continue
+
+        # 人类模式：实时输出，跳过 <think>...</think>
+        if dropping:
+            idx = content.find(_THINK_CLOSE)
+            if idx < 0:
+                continue
+            dropping = False
+            rest = content[idx + len(_THINK_CLOSE):]
+            if not rest:
+                continue
+            content = rest
+        buf += content
+        while True:
+            idx = buf.find(_THINK_OPEN)
+            if idx >= 0:
+                flush(buf[:idx])
+                rest = buf[idx + len(_THINK_OPEN):]
+                end = rest.find(_THINK_CLOSE)
+                if end >= 0:
+                    buf = rest[end + len(_THINK_CLOSE):]
+                    continue          # 同一缓冲内可能还有下一个 think 块
+                dropping = True
+                buf = ""
+                break
+            # 无完整 <think>：只保留尾部可能是前缀的部分，其余全部输出
+            pl = prefix_len(buf)
+            keep = buf[-pl:] if pl else ""
+            flush(buf[:-pl] if pl else buf)
+            buf = keep
+            break
+
+    # 流结束收尾：残留若不是 think 前缀则输出，保证不丢尾巴
+    if buf and not dropping and prefix_len(buf) != len(buf):
+        flush(buf)
+    return sources, content_parts, session_id
+
+
+def cmd_chat(cfg, question, kb_ids, max_chars, as_json):
+    resp = api_chat_stream(cfg, question, kb_ids)
+    sources, content_parts, session_id = _stream_content(resp, as_json)
+
+    answer = strip_think("".join(content_parts))
+    hit = not is_no_hit_answer(answer)
+
+    if as_json:
+        out(json.dumps({
+            "mode": "chat",
+            "query": question,
+            "session_id": session_id,
+            "hit": hit,
+            "answer": answer,
+            "sources": [
+                {
+                    "rank": i,
+                    "name": s.get("name"),
+                    "score": s.get("score"),
+                    "doc_id": s.get("doc_id"),
+                    "knowledge_name": s.get("knowledge_name"),
+                    "catalog": s.get("catalog"),
+                    "chunks": [truncate(c, max_chars) for c in (s.get("chunks") or [])],
+                }
+                for i, s in enumerate(sources, 1)
+            ],
+        }, ensure_ascii=False, indent=2))
+    else:
+        if not content_parts:
+            out("(平台未返回答案正文)")
+        else:
+            out("")
+        out("")
+        if not hit:
+            out("（知识库未命中该问题）")
+        _print_sources(sources, max_chars, hit)
+
+
+def cmd_init():
+    if os.path.exists(CONFIG_PATH):
+        die("配置文件已存在：%s（如需重建请先删除）" % CONFIG_PATH, EXIT_CONFIG)
+    template = {
+        "api_key": "在此填入平台颁发的 API KEY",
+        "recall_base": "http://<网关IP>:<端口>",
+        "chat_base": "http://<网关IP>:<端口>",
+        "tenant_id": "在此填入租户 id",
+        "dept_id": "",
+        "default_kb": "",
+        "timeout": 30,
+        "chat_timeout": 120,
+        "open_llm": "0",
+        "verify_ssl": "1",
+        "admin_contact": "知识平台管理员",
+    }
+    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+        json.dump(template, f, ensure_ascii=False, indent=2)
+    try:
+        os.chmod(CONFIG_PATH, stat.S_IRUSR | stat.S_IWUSR)
+    except OSError:
+        pass
+    out("已生成配置模板：%s（权限已设为 600）" % CONFIG_PATH)
+    out("请编辑填入 api_key / recall_base / chat_base / tenant_id 四项后即可使用。")
+    out("提示：recall_base 和 chat_base 填裸网关地址即可（如 http://10.0.0.1:18000），")
+    out("      工具会自动追加 /rag-platform-default 前缀。")
+
+
+# ---------------------------------------------------------------- main
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="kb-query",
+        description="紫鸾知识平台命令行查询工具：默认检索模式返回带引用的文档块，--chat 返回生成式答案。",
+        epilog="配置优先级：命令行 > 环境变量 > ~/.kb-query.json；退出码：0 成功 / 1 缺配置 / 2 网络或平台错误 / 3 鉴权失败。",
+    )
+    p.add_argument("query", nargs="?", help="要检索/提问的自然语言问题")
+    p.add_argument("--chat", action="store_true", help="问答模式：SSE 流式生成答案 + 引用来源")
+    p.add_argument("--list", action="store_true", help="列出当前租户可用知识库（id + 名称）")
+    p.add_argument("--kb", action="append", metavar="KLB_xxx",
+                   help="指定知识库 id，可重复多次；不指定则用配置的默认库，默认库也为空则查全库")
+    p.add_argument("--top-n", type=int, default=None, metavar="N",
+                   help="检索模式返回的文档块数量（默认 5）")
+    p.add_argument("--max-chars", type=int, default=None, metavar="N",
+                   help="每条文档块正文的最大字符数（默认 500，0 表示不截断）")
+    p.add_argument("--json", action="store_true", help="JSON 输出，供 agent 程序化消费")
+    p.add_argument("--timeout", type=int, default=None, metavar="SEC",
+                   help="覆盖网络超时（秒）；问答模式默认 120，其余默认 30")
+    p.add_argument("--insecure", action="store_true",
+                   help="跳过 SSL 证书校验（自签证书环境使用）")
+    p.add_argument("--init", action="store_true", help="生成 ~/.kb-query.json 配置模板（权限 600）后退出")
+    p.add_argument("--version", action="version", version="kb-query " + __version__)
+    return p
+
+
+def main(argv=None):
+    _setup_io()
+    args = build_parser().parse_args(argv)
+
+    if args.init:
+        cmd_init()
+        return EXIT_OK
+
+    cfg, missing = resolve_config(args)
+    if missing:
+        report_missing(missing)
+    set_api_contact(cfg.get("admin_contact") or "知识平台管理员")
+
+    # 冲突参数警告
+    if args.list and args.chat:
+        warn("--list 与 --chat 同时使用，--chat 将被忽略")
+    if args.list and args.kb:
+        warn("--list 模式下 --kb 无意义，将被忽略")
+    if args.chat and args.top_n is not None:
+        warn("--top-n 在 --chat 模式下无效，将被忽略")
+
+    if args.list:
+        cmd_list(cfg, args.json)
+        return EXIT_OK
+
+    if not args.query or not args.query.strip():
+        die("缺少查询问题或查询内容为空。用法：kb-query \"你的问题\" [--chat] [--kb KLB_xxx] [--json]；--help 查看全部参数", EXIT_CONFIG)
+
+    top_n = args.top_n if args.top_n is not None else 5
+    if top_n < 1:
+        die("--top-n 必须 >= 1", EXIT_CONFIG)
+    max_chars = args.max_chars if args.max_chars is not None else 500
+    if max_chars < 0:
+        die("--max-chars 必须 >= 0（0 表示不截断）", EXIT_CONFIG)
+
+    kb_ids = parse_kb_list(cfg["default_kb"])
+
+    if args.chat:
+        cmd_chat(cfg, args.query, kb_ids, max_chars, args.json)
+    else:
+        cmd_recall(cfg, args.query, kb_ids, top_n, max_chars, args.json)
+    return EXIT_OK
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.stderr.write("\nkb-query: 已取消\n")
+        sys.exit(130)
